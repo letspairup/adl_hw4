@@ -9,7 +9,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoProcessor, Trainer, TrainingArguments
-
+from transformers import CLIPVisionModel, CLIPImageProcessor, AutoTokenizer
 from .base_vlm import BaseVLM
 from .data import CaptionDataset, MultiChoiceQADataset
 
@@ -93,14 +93,20 @@ class CaptionDatasetForTraining(Dataset):
 
 
 class CLIP(nn.Module):
-    def __init__(
-        self, vision_encoder: nn.Module, text_encoder: nn.Module, proj_dim: int = 64, temperature: float = 0.07
-    ):
+    def __init__(self, vit_model="openai/clip-vit-base-patch32", text_model="EleutherAI/gpt-neox-20b"):
         super().__init__()
-        self.vision_encoder = vision_encoder
-        self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+
+        # Image encoder
+        self.vision_model = CLIPVisionModel.from_pretrained(vit_model)
+        self.image_proj = nn.Linear(self.vision_model.config.hidden_size, 256)
+
+        # Text encoder
+        self.text_model = BaseVLM(text_model)
+        self.text_proj = nn.Linear(self.text_model.hidden_size, 256)
+
+        # Tokenizer + processor (used during inference/generation)
+        self.tokenizer = AutoTokenizer.from_pretrained(text_model)
+        self.processor = CLIPImageProcessor.from_pretrained(vit_model)
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(image)
@@ -158,46 +164,41 @@ class CLIP(nn.Module):
         self.vision_encoder.embeddings.register_forward_hook(make_inputs_require_grads)
         self.text_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grads)
 
-    def forward(
-        self,
-        pixel_values: torch.Tensor,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor = None,
-        labels: torch.Tensor = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for the CLIP model.
-        Args:
-            pixel_values: The pixel values of the image.
-            input_ids: The input ids of the text.
-            attention_mask: The attention mask of the text.
-            labels: The labels for the text features.
-            (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-            (Hint: refer to returned values of the __getitem__ method in the CaptionDatasetForTraining class)
-        Returns:
-            TODO: think about the what values should be returned
-        """
-        raise NotImplementedError("Not implemented")
+    def forward(self, pixel_values, input_ids, attention_mask):
+        # Encode images
+        vision_outputs = self.vision_model(pixel_values=pixel_values)
+        image_embeds = vision_outputs.pooler_output  # [B, hidden_dim]
+        image_embeds = self.image_proj(image_embeds)  # [B, 256]
 
+        # Encode text
+        text_embeds = self.text_model.encode(input_ids=input_ids, attention_mask=attention_mask)
+        text_embeds = self.text_proj(text_embeds)  # [B, 256]
 
-def compute_clip_loss(
-    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    labels: torch.Tensor,
-    num_items_in_batch: int | None = None,
-) -> torch.Tensor:
+        # Normalize both
+        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+
+        # Similarity: [B, B]
+        logits = torch.matmul(image_embeds, text_embeds.T)
+
+        return logits
+
+def compute_clip_loss(similarity_logits: torch.Tensor) -> torch.Tensor:
     """
-    Compute the loss for the CLIP model.
+    Compute the symmetric cross-entropy loss over similarity logits.
     Args:
-        outputs: A tuple containing the outputs of CLIP.forward().
-        labels: The labels for the text features.
-        (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-        num_items_in_batch: The number of items in the batch.
-        (NOTE: you don't need to use the variable `num_items_in_batch`, this is just for compatibility with Trainer)
+        similarity_logits: [B, B] matrix of cosine similarities between image and text embeddings
     Returns:
-        The loss for the CLIP model.
+        Scalar contrastive loss
     """
-    raise NotImplementedError("Not implemented")
+    batch_size = similarity_logits.shape[0]
+    labels = torch.arange(batch_size).to(similarity_logits.device)
+
+    # Cross-entropy loss: image→text and text→image
+    loss_i2t = nn.functional.cross_entropy(similarity_logits, labels)
+    loss_t2i = nn.functional.cross_entropy(similarity_logits.T, labels)
+
+    return (loss_i2t + loss_t2i) / 2
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
