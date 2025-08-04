@@ -2,27 +2,57 @@ from pathlib import Path
 
 import fire
 from matplotlib import pyplot as plt
-
-from .generate_qa import draw_detections, extract_frame_info
-
+from .generate_qa import extract_kart_objects, draw_detections, extract_track_info, extract_frame_info
 
 def generate_caption(info_path: str, view_index: int, img_width: int = 150, img_height: int = 100) -> list:
     """
-    Generate caption for a specific view.
+    Generate captions for a specific view as a list of strings.
     """
-    # 1. Ego car
-    # {kart_name} is the ego car.
+    karts = extract_kart_objects(info_path, view_index, img_width, img_height)
+    track = extract_track_info(info_path)
 
-    # 2. Counting
-    # There are {num_karts} karts in the scenario.
+    if not karts:
+        return []
 
-    # 3. Track name
-    # The track is {track_name}.
+    ego = next((k for k in karts if k["is_center_kart"]), None)
+    if ego is None:
+        return []
 
-    # 4. Relative position
-    # {kart_name} is {position} of the ego car.
+    ego_name = ego["kart_name"]
+    num_others = len(karts) - 1
 
-    raise NotImplementedError("Not implemented")
+    captions = []
+
+    # 1. Ego
+    captions.append(f"{ego_name} is the ego car.")
+
+    # 2. Count
+    captions.append(f"There are {len(karts)} karts in the scenario.")
+
+    # 3. Track
+    captions.append(f"The track is {track}.")
+
+    # 4. Relative positions
+    ego_x, ego_y = ego["center"]
+    for kart in karts:
+        if kart["instance_id"] == ego["instance_id"]:
+            continue
+        name = kart["kart_name"]
+        x, y = kart["center"]
+        dx, dy = x - ego_x, y - ego_y
+        horiz = "left" if dx < -5 else "right" if dx > 5 else None
+        vert = "front" if dy < -5 else "back" if dy > 5 else None
+        if horiz and vert:
+            pos = f"{vert} and {horiz}"
+        elif vert:
+            pos = vert
+        elif horiz:
+            pos = horiz
+        else:
+            pos = "near"
+        captions.append(f"{name} is {pos} of the ego car.")
+
+    return captions
 
 
 def check_caption(info_file: str, view_index: int):
