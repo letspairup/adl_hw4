@@ -133,6 +133,11 @@ def train(
         learning_rate: float = 5e-4,
         num_workers: int = 16,
 ):
+
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
     output_dir = Path(__file__).parent / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
