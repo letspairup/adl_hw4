@@ -43,11 +43,11 @@ class BaseVLM:
         return self.batched_generate([image_path], [question])[0]
 
     def batched_generate(
-        self,
-        image_paths: list[str],
-        questions: list[str],
-        num_return_sequences: int | None = None,
-        temperature: float = 0,
+            self,
+            image_paths: list[str],
+            questions: list[str],
+            num_return_sequences: int | None = None,
+            temperature: float = 0,
     ) -> list[str] | list[list[str]]:
         """
         Batched version of generate method.
