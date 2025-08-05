@@ -92,7 +92,9 @@ class CLIP(nn.Module):
         self.image_proj = nn.Linear(vit_model.config.hidden_size, 256)
 
         self.text_model = text_model
-        self.text_proj = nn.Linear(text_model.config.hidden_size, 256)
+        #self.text_proj = nn.Linear(text_model.config.hidden_size, 256)
+        self.text_proj = nn.Linear(getattr(self.text_model, "hidden_size", 4096), 256)
+
         self.tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 
     def forward(self, pixel_values, input_ids, attention_mask):
@@ -147,7 +149,7 @@ def train(
 
     vision_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
     text_encoder = AutoModel.from_pretrained("EleutherAI/gpt-neox-20b")
-    model = CLIP(vision_encoder, text_encoder).to(device).bfloat16()
+    model = CLIP(vision_encoder, text_encoder).to(device)
 
     model.set_trainable_parameters = lambda: None  # dummy placeholder
 
@@ -161,6 +163,7 @@ def train(
         bias="none",
     )
     model = get_peft_model(model, peft_config)
+    model = model.bfloat16()
     model.print_trainable_parameters()
     model.train()
 
