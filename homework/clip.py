@@ -84,8 +84,8 @@ class CaptionDatasetForTraining(Dataset):
         self.dataset = dataset
         self.processor = processor
         self.image_processor = tv.transforms.Compose([
-            tv.transforms.Resize(224),
-            tv.transforms.CenterCrop(224),
+            tv.transforms.Resize(192),
+            tv.transforms.CenterCrop(192),
             tv.transforms.ToTensor(),
             tv.transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),
         ])
@@ -144,11 +144,16 @@ class CLIP(nn.Module):
 
         return eos_hidden
 
-    def forward(self, **kwargs):
-        pixel_values = kwargs["pixel_values"]
-        input_ids = kwargs["input_ids"]
-        attention_mask = kwargs.get("attention_mask", None)
-        labels = kwargs.get("labels", None)
+    def forward(self, *args, **kwargs):
+        if args:
+            pixel_values, input_ids = args[:2]
+            attention_mask = args[2] if len(args) > 2 else None
+            labels = args[3] if len(args) > 3 else None
+        else:
+            pixel_values = kwargs["pixel_values"]
+            input_ids = kwargs["input_ids"]
+            attention_mask = kwargs.get("attention_mask")
+            labels = kwargs.get("labels")
 
         image_feat = self.encode_image(pixel_values)
         text_feat = self.encode_text(input_ids, attention_mask)
@@ -160,7 +165,9 @@ class CLIP(nn.Module):
         text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
 
         logits = torch.matmul(image_embeds, text_embeds.T) * self.logit_scale.exp()
+
         return image_embeds, text_embeds, logits
+
 
 
 def compute_clip_loss(
@@ -250,7 +257,7 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
     clip = load(ckpt_path)
 
     image_processor = tv.transforms.Compose([
-        tv.transforms.Resize(224),
+        tv.transforms.Resize(192),
         tv.transforms.CenterCrop(224),
         tv.transforms.ToTensor(),
         tv.transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),
