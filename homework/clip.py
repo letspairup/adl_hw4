@@ -1,10 +1,9 @@
 from pathlib import Path
 from typing import Any
 import numpy as np
-import torch.nn.functional as F
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision as tv
 from peft import LoraConfig, TaskType, get_peft_model
 from PIL import Image
@@ -15,14 +14,13 @@ from transformers import AutoProcessor, Trainer, TrainingArguments
 from .base_vlm import BaseVLM
 from .data import CaptionDataset, MultiChoiceQADataset
 
+# Processor to tokenize captions and append EOS
 processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct")
 
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 
 def load(model_name: str = "clip_model"):
-    from pathlib import Path
-
     from peft import PeftModel
 
     model_path = Path(__file__).parent / model_name
@@ -30,9 +28,9 @@ def load(model_name: str = "clip_model"):
     vlm = BaseVLM()
     vision_encoder = vlm.model.model.vision_model
     text_encoder = vlm.model.model.text_model
+
     clip = CLIP(vision_encoder, text_encoder)
     clip = PeftModel.from_pretrained(clip, model_path).to(device)
-
     clip.model.load_pretrained(model_path)
     clip.model.eval()
 
@@ -40,19 +38,14 @@ def load(model_name: str = "clip_model"):
 
 
 def clip_data_collator(features: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    """
-    Custom data collator for CLIP training.
-    """
-    # Get max sequence length
     max_length = max(f["input_ids"].shape[0] for f in features)
-
     def pad_tensor(tensor, pad_value):
         return torch.cat([tensor, torch.full((max_length - tensor.shape[0],), pad_value, dtype=tensor.dtype)])
 
-    input_ids = torch.stack([pad_tensor(f["input_ids"], pad_value=processor.tokenizer.eos_token_id) for f in features])
-    attention_mask = torch.stack([pad_tensor(f["attention_mask"], pad_value=0) for f in features])
-    pixel_values = torch.stack([f["pixel_values"] for f in features])  # assume all are same shape
-    labels = torch.stack([pad_tensor(f["labels"], pad_value=-100) for f in features])
+    input_ids = torch.stack([pad_tensor(f["input_ids"], processor.tokenizer.eos_token_id) for f in features])
+    attention_mask = torch.stack([pad_tensor(f["attention_mask"], 0) for f in features])
+    pixel_values = torch.stack([f["pixel_values"] for f in features])
+    labels = torch.stack([pad_tensor(f["labels"], -100) for f in features])
 
     return {
         "input_ids": input_ids.long(),
@@ -65,14 +58,12 @@ def clip_data_collator(features: list[dict[str, torch.Tensor]]) -> dict[str, tor
 class CaptionDatasetForTraining(Dataset):
     def __init__(self, dataset: CaptionDataset, processor: AutoProcessor):
         self.dataset = dataset
-        self.image_processor = tv.transforms.Compose(
-            [
-                tv.transforms.Resize(192),
-                tv.transforms.RandomResizedCrop(192, scale=(0.5, 1.0)),
-                tv.transforms.ToTensor(),
-                tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
+        self.image_processor = tv.transforms.Compose([
+            tv.transforms.Resize(192),
+            tv.transforms.RandomResizedCrop(192, scale=(0.5, 1.0)),
+            tv.transforms.ToTensor(),
+            tv.transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),
+        ])
         self.processor = processor
 
     def __len__(self):
@@ -80,132 +71,105 @@ class CaptionDatasetForTraining(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self.dataset[idx]
-        image = Image.open(item["image_path"]).convert("RGB")
-        pixel_values = self.image_processor(image)
+        img = Image.open(item["image_path"]).convert("RGB")
+        pixel_values = self.image_processor(img)
+
         text = item["caption"] + self.processor.tokenizer.eos_token
-        text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True)
-        input_ids = text_inputs["input_ids"].squeeze(0).long()
-        attention_mask = text_inputs["attention_mask"].squeeze(0)
+        txt_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True)
+        input_ids = txt_inputs["input_ids"].squeeze(0).long()
+        attention_mask = txt_inputs["attention_mask"].squeeze(0)
         return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": input_ids,  # placeholder to fit the collator
+            "labels": input_ids,
         }
 
 
 class CLIP(nn.Module):
-    def __init__(
-            self, vision_encoder: nn.Module, text_encoder: nn.Module, proj_dim: int = 64, temperature: float = 0.07
-    ):
+    def __init__(self, vision_encoder: nn.Module, text_encoder: nn.Module, proj_dim: int = 64, temperature: float = 0.07):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
+
         vision_hidden_dim = vision_encoder.config.hidden_size
         text_hidden_dim = text_encoder.config.hidden_size
 
         self.image_proj = nn.Linear(vision_hidden_dim, proj_dim)
         self.text_proj = nn.Linear(text_hidden_dim, proj_dim)
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/temperature))
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1.0 / temperature))
 
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        return self.vision_encoder(image)
+    def forward(self, pixel_values, input_ids, attention_mask=None, labels=None, **kwargs):
+        v_out = self.vision_encoder(pixel_values=pixel_values)
+        if getattr(v_out, "pooler_output", None) is not None:
+            v_feat = v_out.pooler_output
+        elif getattr(v_out, "image_embeds", None) is not None:
+            v_feat = v_out.image_embeds
+        else:
+            v_feat = v_out.last_hidden_state[:, 0, :]
 
-    def encode_text(self, text: str) -> torch.Tensor:
-        return self.text_encoder(text)
+        t_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        if getattr(t_out, "pooler_output", None) is not None:
+            t_feat = t_out.pooler_output
+        else:
+            hidden = t_out.last_hidden_state
+            if attention_mask is None:
+                t_feat = hidden[:, -1, :]
+            else:
+                lengths = attention_mask.sum(dim=1) - 1
+                gather_idx = lengths.view(-1, 1, 1).expand(-1, 1, hidden.size(-1))
+                t_feat = hidden.gather(1, gather_idx).squeeze(1)
+
+        img_emb = F.normalize(self.image_proj(v_feat), dim=-1)
+        txt_emb = F.normalize(self.text_proj(t_feat), dim=-1)
+
+        return img_emb, txt_emb, self.logit_scale
 
     def save_pretrained(self, save_directory: str, **kwargs):
-        """Customize save method, save additional parameters"""
-
-        additional_state_dict = {}
-        for name, param in self.named_parameters():
-            if "vision_encoder." in name or "text_encoder." in name:
-                continue
-            additional_state_dict[name] = param.data
-
-        torch.save(additional_state_dict, Path(save_directory) / "additional_weights.pt")
+        state = {n: p.data for n, p in self.named_parameters() if "vision_encoder." not in n and "text_encoder." not in n}
+        torch.save(state, Path(save_directory) / "additional_weights.pt")
 
     def load_pretrained(self, load_directory: str, **kwargs):
-        """Customize load method, load projection additional parameters"""
-
-        additional_weights_path = Path(load_directory) / "additional_weights.pt"
-        if additional_weights_path.exists():
-            additional_state_dict = torch.load(additional_weights_path, map_location="cpu")
-
-            for name, param in self.named_parameters():
-                if "vision_encoder." in name or "text_encoder." in name:
-                    continue
-                param.data = additional_state_dict[name]
+        path = Path(load_directory) / "additional_weights.pt"
+        if path.exists():
+            state = torch.load(path, map_location="cpu")
+            for n, p in self.named_parameters():
+                if n in state and "vision_encoder." not in n and "text_encoder." not in n:
+                    p.data = state[n]
 
     def set_trainable_parameters(self):
-        for name, param in self.named_parameters():
-            if "vision_encoder." in name or "text_encoder." in name:
-                continue
-            param.requires_grad = True
+        for n, p in self.named_parameters():
+            if "vision_encoder." in n or "text_encoder." in n:
+                p.requires_grad = False
+            else:
+                p.requires_grad = True
 
     def gradient_checkpointing_enable(self, **kwargs):
-        """
-        Enable gradient checkpointing for the vision and text backbones.
-        (You don't need to touch this method)
-        """
         self.vision_encoder.gradient_checkpointing_enable(**kwargs)
         self.text_encoder.gradient_checkpointing_enable(**kwargs)
 
     def enable_input_require_grads(self):
-        """
-        Enable input require grads for the vision and text backbones.
-        (You don't need to touch this method)
-        """
-
-        # Reference: https://discuss.huggingface.co/t/peft-lora-gpt-neox-backward-pass-failing/35641
-        def make_inputs_require_grads(module, input, output):  # noqa: A002
-            output.requires_grad_(True)
-
-        self.vision_encoder.embeddings.register_forward_hook(make_inputs_require_grads)
-        self.text_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grads)
-
-    def forward(self, pixel_values, input_ids, attention_mask=None, labels=None, **kwargs):
-        img_out = self.vision_encoder(pixel_values)
-        # Try the appropriate field name
-        img_feat = getattr(img_out, "pooler_output", None) or img_out.last_hidden_state[:, 0, :]
-
-        txt_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-        txt_feat = txt_out.last_hidden_state[:, 0, :]
-
-        img_emb = self.image_proj(img_feat)
-        txt_emb = self.text_proj(txt_feat)
-
-        scale = torch.exp(self.logit_scale)
-        logits_per_image = scale * img_emb @ txt_emb.T
-        logits_per_text = logits_per_image.T
-        return logits_per_image, logits_per_text, scale
+        def hook(_module, _inp, out): out.requires_grad_(True)
+        if hasattr(self.vision_encoder, "embeddings"):
+            self.vision_encoder.embeddings.register_forward_hook(hook)
+        if hasattr(self.text_encoder, "get_input_embeddings"):
+            self.text_encoder.get_input_embeddings().register_forward_hook(hook)
 
 
-def compute_clip_loss(
-        outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        labels: torch.Tensor,
-        num_items_in_batch: int | None = None,
-) -> torch.Tensor:
-    logits_per_image, logits_per_text, _ = outputs
-    batch_size = logits_per_image.shape[0]
-    device = logits_per_image.device
-    target = torch.arange(batch_size, device=device)
-    loss_i = F.cross_entropy(logits_per_image, target)
-    loss_t = F.cross_entropy(logits_per_text, target)
-    return (loss_i + loss_t) / 2
+def compute_clip_loss(outputs, labels, num_items_in_batch=None):
+    image_embeds, text_embeds, logit_scale = outputs
+    logits_i = (image_embeds @ text_embeds.T) * torch.exp(logit_scale)
+    logits_t = logits_i.T
+
+    bsz = logits_i.size(0)
+    target = torch.arange(bsz, device=logits_i.device)
+    return 0.5 * (F.cross_entropy(logits_i, target) + F.cross_entropy(logits_t, target))
+
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
-    target_modules = []
-    for name, module in model.named_modules():
-        # if isinstance(module, nn.Linear) and ("vision_encoder" in name and "projection" not in name):
-        if (
-                isinstance(module, nn.Linear)
-                and ("vision_encoder" in name or "text_encoder" in name)
-                and "projection" not in name
-        ):
-            target_modules.append(name)
+    return [n for n, m in model.named_modules()
+            if isinstance(m, nn.Linear) and ("vision_encoder" in n or "text_encoder" in n) and "projection" not in n]
 
-    return target_modules
 
 
 def train(
