@@ -164,19 +164,17 @@ class CLIP(nn.Module):
         self.vision_encoder.embeddings.register_forward_hook(make_inputs_require_grads)
         self.text_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grads)
 
-    def forward(
-            self,
-            pixel_values: torch.Tensor,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor = None,
-            labels: torch.Tensor = None,
-            **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        img_feat = self.vision_encoder(pixel_values)
+    def forward(self, pixel_values, input_ids, attention_mask=None, labels=None, **kwargs):
+        img_out = self.vision_encoder(pixel_values)
+        # Try the appropriate field name
+        img_feat = getattr(img_out, "pooler_output", None) or img_out.last_hidden_state[:, 0, :]
+
         txt_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-        txt_feat = txt_out.last_hidden_state[:, 0, :]  # assuming CLS/eos pooling
+        txt_feat = txt_out.last_hidden_state[:, 0, :]
+
         img_emb = self.image_proj(img_feat)
         txt_emb = self.text_proj(txt_feat)
+
         scale = torch.exp(self.logit_scale)
         logits_per_image = scale * img_emb @ txt_emb.T
         logits_per_text = logits_per_image.T
